@@ -14,6 +14,7 @@ import { toast } from 'sonner';
 import { useDownload } from '@/contexts/DownloadContext';
 import { normalizeDownloadSource } from '@/lib/download';
 import { useDanmu } from '@/hooks/useDanmu';
+import OptimizedHlsLoader from '@/lib/hls-loader';
 import type { DanmuManualOverride } from '@/hooks/useDanmu';
 import DownloadEpisodeSelector from '@/components/download/DownloadEpisodeSelector';
 import DanmuManualMatchModal, { type DanmuManualSelection } from '@/components/DanmuManualMatchModal';
@@ -58,7 +59,7 @@ import {
 } from '@/lib/db.client';
 import { getDoubanDetails, getDoubanComments, getDoubanActorMovies } from '@/lib/douban.client';
 import { SearchResult } from '@/lib/types';
-import { applyFirstPartyM3u8Proxy, applyVideoPlayProxy, getVideoResolutionFromM3u8, isFirstPartyM3u8Proxy, processImageUrl, stripVideoPlayProxy, VideoSourceTestResult } from '@/lib/utils';
+import { applyFirstPartyM3u8Proxy, applyVideoPlayProxy, getArtPlayerType, getVideoResolutionFromM3u8, isFirstPartyM3u8Proxy, processImageUrl, stripVideoPlayProxy, VideoSourceTestResult } from '@/lib/utils';
 import { useWatchRoomContextSafe } from '@/components/WatchRoomProvider';
 import { useWatchRoomSync } from './hooks/useWatchRoomSync';
 import {
@@ -2793,36 +2794,6 @@ function PlayPageClient() {
     }
   };
 
-  class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
-    constructor(config: any) {
-      super(config);
-      const load = this.load.bind(this);
-      this.load = function (context: any, config: any, callbacks: any) {
-        // 拦截manifest和level请求
-        if (
-          (context as any).type === 'manifest' ||
-          (context as any).type === 'level'
-        ) {
-          const onSuccess = callbacks.onSuccess;
-          callbacks.onSuccess = function (
-            response: any,
-            stats: any,
-            context: any
-          ) {
-            // 如果是m3u8文件，处理内容以移除广告分段
-            if (response.data && typeof response.data === 'string') {
-              // 过滤掉广告段 - 实现更精确的广告过滤逻辑
-              response.data = filterAdsFromM3U8(response.data);
-            }
-            return onSuccess(response, stats, context, null);
-          };
-        }
-        // 执行原始load方法
-        load(context, config, callbacks);
-      };
-    }
-  }
-
 
   // 🚀 优化的集数变化处理（防抖 + 状态保护）
   useEffect(() => {
@@ -4253,6 +4224,8 @@ function PlayPageClient() {
 
         // ☁️ 新地址切换，重置 Worker 代理降级标记（非 m3u8 路径用）
         artPlayerRef.current._proxyFallbackDone = false;
+        // 切换的新地址可能是 m3u8 代理地址，也可能是普通格式，每次都要重新指定 type
+        artPlayerRef.current.option.type = getArtPlayerType(videoUrl);
 
         let switchPromise: Promise<any>;
         if (isEpisodeChange) {
@@ -4399,6 +4372,8 @@ function PlayPageClient() {
       artPlayerRef.current = new Artplayer({
         container: artRef.current,
         url: videoUrl,
+        // 代理地址的扩展名无法被 ArtPlayer 识别为 m3u8，必须显式指定
+        type: getArtPlayerType(videoUrl),
         poster: videoCover,
         volume: 0.7,
         isLive: false,
@@ -4522,9 +4497,18 @@ function PlayPageClient() {
                 },
               },
 
-              /* 自定义loader */
+              /* 优化的 HLS Loader：广告过滤 + 并发分片预取 */
               loader: blockAdEnabledRef.current
-                ? CustomHlsJsLoader
+                ? class extends OptimizedHlsLoader {
+                    constructor(config: any) {
+                      super({
+                        ...config,
+                        filterAds: true,
+                        enableDirectConnect: false,
+                        sourceKey: '',
+                      });
+                    }
+                  }
                 : Hls.DefaultConfig.loader,
             });
 
@@ -5983,13 +5967,15 @@ function PlayPageClient() {
           return;
         }
 
-        // ☁️ 非 m3u8 格式（走原生 <video src>）Worker 代理失败时，自动降级为直连原始地址
-        // m3u8 格式的降级在 customType.m3u8 的 Hls.Events.ERROR 处理里完成，此处跳过避免重复
-        if (!artPlayerRef.current._proxyFallbackDone) {
+        // ☁️ Worker 代理播放失败时，自动降级为直连原始地址
+        // hls.js 已接管时（video.hls 存在），降级在 customType.m3u8 的 Hls.Events.ERROR 里完成，此处跳过避免重复；
+        // 但 hls.js 没启动（如 type 未识别）时没有任何人会降级，必须在这里兜底
+        if (!artPlayerRef.current._proxyFallbackDone && !artPlayerRef.current.video?.hls) {
           const rawUrl = stripVideoPlayProxy(videoUrl);
-          if (rawUrl && !/\.m3u8(\?|#|$)/i.test(videoUrl)) {
+          if (rawUrl) {
             console.warn('Worker 代理播放错误，降级为直连:', rawUrl);
             artPlayerRef.current._proxyFallbackDone = true;
+            artPlayerRef.current.option.type = getArtPlayerType(rawUrl);
             artPlayerRef.current.switchUrl(rawUrl);
           }
         }
